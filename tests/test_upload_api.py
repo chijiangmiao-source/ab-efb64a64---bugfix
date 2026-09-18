@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -302,3 +305,80 @@ def test_unknown_session_and_route(client):
     resp = client.get("/no-such-route")
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+# ---------- concurrent uploads ----------
+
+def test_concurrent_uploads_merge_bitmap_atomically(client, monkeypatch):
+    """Two different chunks uploaded concurrently must both land in the bitmap.
+
+    Regression test for a lost-update: both uploads used to read the same stale
+    session bitmap OUTSIDE the DB lock (before streaming the body) and then
+    overwrite the whole bitmap BLOB on commit, so the second committer erased
+    the first uploader's bit. The uploads run on real OS threads (each with its
+    own event loop) and are parked on a barrier right after that lock-free read,
+    guaranteeing both hold the same old bitmap before either one streams or
+    commits -- the overlap window is deterministic, not timing-dependent.
+    """
+    payload = make_bytes(8)
+    chunk_size = 4
+    sid = create_session(client, payload, chunk_size)["session_id"]
+    bodies = [chunk(payload, chunk_size, i) for i in range(2)]
+
+    service = client.app.state.service
+    real_get_session = service.get_session_or_404
+    barrier = threading.Barrier(2)
+    reads = {"outside": 0}
+
+    def gated_get_session(session_id):
+        sess = real_get_session(session_id)
+        # Gate only the one pre-stream read each upload makes OUTSIDE the lock;
+        # the later in-lock re-read (call #3+) must pass straight through.
+        reads["outside"] += 1
+        if reads["outside"] <= 2:
+            barrier.wait(timeout=10)
+        return sess
+
+    def upload(index):
+        body = bodies[index]
+
+        async def body_stream():
+            yield body[:2]
+            yield body[2:]
+
+        return asyncio.run(
+            service.upload_chunk(sid, str(index), sha256(body), body_stream())
+        )
+
+    monkeypatch.setattr(service, "get_session_or_404", gated_get_session)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(upload, (0, 1)))
+    finally:
+        monkeypatch.undo()
+
+    # both uploads are new chunks and must be accepted
+    assert sorted(status for _receipt, status in results) == [201, 201]
+
+    # both chunks are durably recorded ...
+    rows = service.db.list_chunks(sid)
+    assert sorted(row["chunk_index"] for row in rows) == [0, 1]
+    # ... and both body files are on disk
+    assert service.store.chunk_path(sid, 0).read_bytes() == bodies[0]
+    assert service.store.chunk_path(sid, 1).read_bytes() == bodies[1]
+
+    # the bitmap must show BOTH bits: received_count=2, no missing chunks,
+    # without relying on a restart/reconcile to repair it
+    status = client.get(f"/sessions/{sid}").json()
+    assert status["received_count"] == 2
+    assert status["missing_chunks"] == []
+
+    # immediate finalize must succeed and publish the verified artifact;
+    # previously this returned CHUNKS_INCOMPLETE until a restart reconcile
+    # accidentally rebuilt the bitmap from the chunks table
+    resp = client.post(f"/sessions/{sid}/finalize")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "completed"
+    assert resp.json()["final_sha256"] == sha256(payload)
+    assert client.get(f"/sessions/{sid}/artifact").content == payload
+

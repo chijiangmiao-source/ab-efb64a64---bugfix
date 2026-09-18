@@ -87,18 +87,33 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def insert_chunk_with_bitmap(self, rec: dict, bitmap: bytes) -> None:
-        """Record a confirmed chunk and flip its bitmap bit in one transaction."""
+    def insert_chunk_and_set_bit(self, rec: dict, index: int) -> bytes:
+        """Record a confirmed chunk and merge its bit into the session bitmap.
+
+        The bitmap is re-read inside this same transaction (which runs while
+        holding the write lock) and only the one bit is flipped before writing
+        it back. Concurrent uploads of *different* chunks therefore merge their
+        bits instead of each overwriting a stale snapshot read before the lock;
+        the chunk row and its bit become visible atomically. Returns the merged
+        bitmap so the caller can refresh its in-memory session snapshot.
+        """
         with self.lock, self._conn:
             self._conn.execute(
                 "INSERT INTO chunks (session_id, chunk_index, size, sha256, path, received_at)"
                 " VALUES (:session_id, :chunk_index, :size, :sha256, :path, :received_at)",
                 rec,
             )
+            row = self._conn.execute(
+                "SELECT bitmap FROM sessions WHERE session_id = ?",
+                (rec["session_id"],),
+            ).fetchone()
+            merged = bytearray(row["bitmap"])
+            merged[index >> 3] |= 1 << (index & 7)
             self._conn.execute(
                 "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
-                (bitmap, rec["session_id"]),
+                (bytes(merged), rec["session_id"]),
             )
+            return bytes(merged)
 
     def delete_chunk(self, session_id: str, index: int) -> None:
         with self.lock, self._conn:

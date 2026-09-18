@@ -104,10 +104,16 @@ class UploadService:
                     {"chunk_index": index, "declared_sha256": digest, "actual_sha256": actual},
                 )
             with self.db.lock:
+                # Re-read the authoritative session under the lock. The snapshot
+                # taken before streaming may be stale when another upload commits
+                # concurrently; every status/expiry/bitmap decision below (and
+                # the receipts) must use this fresh one or a concurrent commit
+                # would be silently overwritten.
+                locked_session = self.get_session_or_404(session_id)
                 existing = self.db.get_chunk(session_id, index)
                 if existing is not None:
                     if existing["sha256"] == digest:
-                        return self._chunk_receipt(session, existing, duplicate=True), 200
+                        return self._chunk_receipt(locked_session, existing, duplicate=True), 200
                     raise ApiError(
                         409,
                         "CHUNK_CONFLICT",
@@ -118,14 +124,14 @@ class UploadService:
                             "rejected_sha256": digest,
                         },
                     )
-                if self.is_expired(session):
+                if self.is_expired(locked_session):
                     raise ApiError(
                         410,
                         "SESSION_EXPIRED",
                         "session has expired; new chunks are rejected",
-                        {"expires_at": session["expires_at"]},
+                        {"expires_at": locked_session["expires_at"]},
                     )
-                if session["status"] != "active":
+                if locked_session["status"] != "active":
                     raise ApiError(
                         409,
                         "SESSION_ALREADY_COMPLETED",
@@ -142,11 +148,11 @@ class UploadService:
                     "path": str(final_path),
                     "received_at": clock.utcnow().isoformat(),
                 }
-                bitmap = bytearray(session["bitmap"])
-                set_bit(bitmap, index)
-                session["bitmap"] = bytes(bitmap)
-                self.db.insert_chunk_with_bitmap(record, session["bitmap"])
-                return self._chunk_receipt(session, record, duplicate=False), 201
+                # Insert the row and merge this bit into the bitmap atomically in
+                # the database; then refresh our authoritative snapshot so the
+                # receipt and later reads see the merged bitmap.
+                locked_session["bitmap"] = self.db.insert_chunk_and_set_bit(record, index)
+                return self._chunk_receipt(locked_session, record, duplicate=False), 201
         finally:
             if not committed:
                 self.store.discard(tmp)
