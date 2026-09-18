@@ -6,6 +6,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from .bitmap import set_bit
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id    TEXT PRIMARY KEY,
@@ -87,18 +89,33 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def insert_chunk_with_bitmap(self, rec: dict, bitmap: bytes) -> None:
-        """Record a confirmed chunk and flip its bitmap bit in one transaction."""
+    def insert_chunk_with_bitmap(self, rec: dict) -> bytes:
+        """Record a confirmed chunk and merge its bit into the persisted bitmap.
+
+        The bitmap bit is OR-ed into the bitmap as it currently exists in the
+        database (within this same transaction), never replaced by a caller
+        snapshot. Concurrent uploads of *different* indices therefore merge
+        atomically instead of the last writer clobbering the others' bits.
+        Returns the merged bitmap.
+        """
+        session_id = rec["session_id"]
+        index = rec["chunk_index"]
         with self.lock, self._conn:
             self._conn.execute(
                 "INSERT INTO chunks (session_id, chunk_index, size, sha256, path, received_at)"
                 " VALUES (:session_id, :chunk_index, :size, :sha256, :path, :received_at)",
                 rec,
             )
+            row = self._conn.execute(
+                "SELECT bitmap FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            bitmap = bytearray(row["bitmap"])
+            set_bit(bitmap, index)
             self._conn.execute(
                 "UPDATE sessions SET bitmap = ? WHERE session_id = ?",
-                (bitmap, rec["session_id"]),
+                (bytes(bitmap), session_id),
             )
+        return bytes(bitmap)
 
     def delete_chunk(self, session_id: str, index: int) -> None:
         with self.lock, self._conn:

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app import clock
@@ -302,3 +304,84 @@ def test_unknown_session_and_route(client):
     resp = client.get("/no-such-route")
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+# ---------- concurrent uploads ----------
+
+def test_concurrent_distinct_chunks_merge_bitmap_and_finalize(client, monkeypatch):
+    """Two different chunks uploaded concurrently must atomically merge bits.
+
+    Acceptance scenario (no restart allowed to repair the state):
+      1. create a session with exactly two chunks;
+      2. upload chunk 0 and chunk 1 concurrently, parked with an asyncio
+         barrier so both calls have read the same stale session snapshot
+         (outside the write lock) before either of them commits;
+      3. both uploads return 201 and both chunk rows/files are persisted;
+      4. status reports received_count=2 and missing_chunks=[];
+      5. finalize succeeds immediately (200) and the artifact verifies.
+    """
+    payload = make_bytes(8)
+    created = create_session(client, payload, 4)
+    sid = created["session_id"]
+    # real state right after "create a session with two chunks"
+    assert created["total_chunks"] == 2
+    assert created["received_count"] == 0
+    assert created["missing_chunks"] == [0, 1]
+
+    bodies = [chunk(payload, 4, 0), chunk(payload, 4, 1)]
+    service = client.app.state.service
+    original_write_tmp = service.store.write_chunk_tmp
+
+    async def scenario():
+        # Both upload coroutines must be parked here before either commits.
+        # write_chunk_tmp is awaited *after* upload_chunk reads its session
+        # snapshot, so reaching this barrier proves both hold the same old
+        # zero-bit bitmap.
+        both_read_snapshot = asyncio.Barrier(2)
+
+        async def racing_write_tmp(session_id, stream):
+            assert session_id == sid
+            await both_read_snapshot.wait()
+            return await original_write_tmp(session_id, stream)
+
+        monkeypatch.setattr(service.store, "write_chunk_tmp", racing_write_tmp)
+
+        async def put(index: int) -> httpx.Response:
+            return await ac.put(
+                f"/sessions/{sid}/chunks/{index}",
+                content=bodies[index],
+                headers={"X-Chunk-SHA256": sha256(bodies[index])},
+            )
+
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+            r0, r1 = await asyncio.gather(put(0), put(1))
+        return r0, r1
+
+    r0, r1 = asyncio.run(scenario())
+
+    # both uploads succeed on the first attempt
+    assert r0.status_code == 201, r0.text
+    assert r1.status_code == 201, r1.text
+    assert r0.json()["duplicate"] is False
+    assert r1.json()["duplicate"] is False
+
+    # both chunk records and both bodies are durable
+    rows = service.db.list_chunks(sid)
+    assert sorted(row["chunk_index"] for row in rows) == [0, 1]
+    assert service.store.chunk_path(sid, 0).exists()
+    assert service.store.chunk_path(sid, 1).exists()
+
+    # the merged bitmap sees both chunks -- no lost update, no restart needed
+    status = client.get(f"/sessions/{sid}").json()
+    assert status["received_count"] == 2
+    assert status["missing_chunks"] == []
+
+    # finalize must succeed immediately: full-file checksum and publish
+    finalize = client.post(f"/sessions/{sid}/finalize")
+    assert finalize.status_code == 200, finalize.text
+    assert finalize.json()["status"] == "completed"
+    assert finalize.json()["final_sha256"] == sha256(payload)
+    download = client.get(f"/sessions/{sid}/artifact")
+    assert download.status_code == 200
+    assert download.content == payload

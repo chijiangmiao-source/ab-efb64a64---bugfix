@@ -104,6 +104,11 @@ class UploadService:
                     {"chunk_index": index, "declared_sha256": digest, "actual_sha256": actual},
                 )
             with self.db.lock:
+                # Re-read the session under the lock: the duplicate/liveness
+                # checks below and the bitmap merge must act on current state,
+                # not on the snapshot taken before the body was streamed
+                # (another upload may have committed meanwhile).
+                session = self.get_session_or_404(session_id)
                 existing = self.db.get_chunk(session_id, index)
                 if existing is not None:
                     if existing["sha256"] == digest:
@@ -142,10 +147,9 @@ class UploadService:
                     "path": str(final_path),
                     "received_at": clock.utcnow().isoformat(),
                 }
-                bitmap = bytearray(session["bitmap"])
-                set_bit(bitmap, index)
-                session["bitmap"] = bytes(bitmap)
-                self.db.insert_chunk_with_bitmap(record, session["bitmap"])
+                # Merge this bit with whatever concurrent uploads committed;
+                # never overwrite the bitmap with the stale snapshot above.
+                session["bitmap"] = self.db.insert_chunk_with_bitmap(record)
                 return self._chunk_receipt(session, record, duplicate=False), 201
         finally:
             if not committed:
